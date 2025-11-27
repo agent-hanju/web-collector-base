@@ -36,7 +36,7 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
    * @param batchSize 배치 크기
    * @return 수집 결과
    */
-  public final ContentCollectedResult collect(List<T> ids, int batchSize) {
+  public final ContentCollectedResult collect(final List<T> ids, final int batchSize) {
     return collect(ids, batchSize, ICollectorLogger.noOp());
   }
 
@@ -48,25 +48,23 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
    * @param logger    로거
    * @return 수집 결과
    */
-  public final ContentCollectedResult collect(List<T> ids, int batchSize, ICollectorLogger logger) {
+  public final ContentCollectedResult collect(final List<T> ids, final int batchSize, final ICollectorLogger logger) {
     final int totalCount = ids.size();
     final AtomicInteger successCount = new AtomicInteger(0);
     final AtomicInteger failureCount = new AtomicInteger(0);
     final AtomicInteger batchNumber = new AtomicInteger(0);
+    final List<CompletableFuture<Void>> flushFutures = new ArrayList<>();
 
     logger.onStart(totalCount, totalCount);
 
     try {
       final List<CompletableFuture<Void>> futures = new ArrayList<>();
-      int index = 0;
 
-      for (T id : ids) {
-        if (isShutdownRequested()) {
-          break;
-        }
+      for (int i = 0; i < ids.size() && !isShutdownRequested(); i++) {
+        final T id = ids.get(i);
+        final int currentIndex = i;
 
-        final int currentIndex = ++index;
-        final CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+        futures.add(CompletableFuture.runAsync(() -> {
           try {
             processContent(id);
             successCount.incrementAndGet();
@@ -75,33 +73,45 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
             failureCount.incrementAndGet();
             logger.onUnitFail(currentIndex, e);
           }
-        }, getExecutor());
-        futures.add(future);
+        }, getExecutor()));
 
-        // 배치 크기마다 저장
+        // 배치 크기마다 flush
         if (futures.size() >= batchSize) {
           CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
           futures.clear();
-          saveBatchWithLogging(batchNumber.incrementAndGet(), successCount.get(), logger);
+          flushFutures.add(CompletableFuture.runAsync(
+              () -> flushWithLogging(batchNumber.incrementAndGet(), successCount.get(), logger),
+              getFlushExecutor()));
         }
       }
 
       // 남은 작업 처리
       if (!futures.isEmpty()) {
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        saveBatchWithLogging(batchNumber.incrementAndGet(), successCount.get(), logger);
+        flushFutures.add(CompletableFuture.runAsync(
+            () -> flushWithLogging(batchNumber.incrementAndGet(), successCount.get(), logger),
+            getFlushExecutor()));
       }
+
+      // 모든 flush 완료 대기
+      CompletableFuture.allOf(flushFutures.toArray(new CompletableFuture[0])).join();
 
       logger.onComplete(totalCount, totalCount, failureCount.get(), successCount.get());
 
     } catch (Exception e) {
+      // 에러 발생 시에도 진행 중인 flush 완료 대기 (데이터 손실 방지)
+      try {
+        CompletableFuture.allOf(flushFutures.toArray(new CompletableFuture[0])).join();
+      } catch (Exception ignored) {
+        // 로깅은 flushWithLogging에서 이미 처리됨
+      }
       logger.onError(totalCount, totalCount, successCount.get(), failureCount.get(), successCount.get(), e);
     }
 
     return new ContentCollectedResult(totalCount, successCount.get(), failureCount.get());
   }
 
-  private void saveBatchWithLogging(int batch, int itemCount, ICollectorLogger logger) {
+  private void flushWithLogging(int batch, int itemCount, ICollectorLogger logger) {
     try {
       saveBatch();
       logger.onBatchSuccess(batch, itemCount);

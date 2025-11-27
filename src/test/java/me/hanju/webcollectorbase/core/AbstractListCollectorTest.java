@@ -1,9 +1,15 @@
 package me.hanju.webcollectorbase.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -106,7 +112,8 @@ class AbstractListCollectorTest {
       }
 
       @Override
-      protected void saveBatch() {}
+      protected void saveBatch() {
+      }
 
       @Override
       public boolean isShutdownRequested() {
@@ -118,5 +125,138 @@ class AbstractListCollectorTest {
 
     // 첫 페이지 + 2페이지까지 처리 후 중단 (3페이지부터 중단)
     assertEquals(2, collected.size());
+  }
+
+  @Test
+  @DisplayName("비동기 모드: 모든 배치 저장 성공")
+  void asyncSave_allBatchesSaved() {
+    List<Integer> savedBatches = Collections.synchronizedList(new ArrayList<>());
+    AtomicInteger processCount = new AtomicInteger(0);
+
+    AbstractListCollector collector = new AbstractListCollector() {
+      @Override
+      protected PageInfo processPage(int page) {
+        processCount.incrementAndGet();
+        return new PageInfo(10, 100, 10);
+      }
+
+      @Override
+      protected void saveBatch() {
+        savedBatches.add(1);
+        // 저장 지연 시뮬레이션
+        try {
+          Thread.sleep(10);
+        } catch (InterruptedException ignored) {
+        }
+      }
+
+      @Override
+      public Executor getFlushExecutor() {
+        return Executors.newFixedThreadPool(2);
+      }
+    };
+
+    ListCollectedResult result = collector.collect(3);
+
+    // 10페이지, 배치 크기 3 -> 3번 저장 (첫페이지 제외 9페이지: 9 / 3 = 3번)
+    assertEquals(3, savedBatches.size());
+    assertEquals(10, result.successPageCount());
+    assertEquals(10, processCount.get());
+  }
+
+  @Test
+  @DisplayName("비동기 모드: 저장 실패해도 수집 계속 진행")
+  void asyncSave_continuesOnSaveFailure() {
+    AtomicInteger processCount = new AtomicInteger(0);
+    AtomicInteger saveCallCount = new AtomicInteger(0);
+
+    AbstractListCollector collector = new AbstractListCollector() {
+      @Override
+      protected PageInfo processPage(int page) {
+        processCount.incrementAndGet();
+        return new PageInfo(10, 100, 10);
+      }
+
+      @Override
+      protected void saveBatch() {
+        int call = saveCallCount.incrementAndGet();
+        if (call == 2) {
+          throw new RuntimeException("Save failed on batch 2");
+        }
+      }
+
+      @Override
+      public Executor getFlushExecutor() {
+        return Runnable::run; // 동기지만 비동기 경로 테스트
+      }
+    };
+
+    collector.collect(3);
+
+    // 저장 실패와 무관하게 모든 페이지 처리됨
+    assertEquals(10, processCount.get());
+  }
+
+  @Test
+  @DisplayName("비동기 모드: collect() 반환 전 모든 저장 완료 보장")
+  void asyncSave_allSavesCompletedBeforeReturn() {
+    AtomicBoolean allSavesCompleted = new AtomicBoolean(false);
+    AtomicInteger saveCount = new AtomicInteger(0);
+
+    AbstractListCollector collector = new AbstractListCollector() {
+      @Override
+      protected PageInfo processPage(int page) {
+        return new PageInfo(7, 70, 10);
+      }
+
+      @Override
+      protected void saveBatch() {
+        try {
+          Thread.sleep(50);
+        } catch (InterruptedException ignored) {
+        }
+        if (saveCount.incrementAndGet() == 3) {
+          allSavesCompleted.set(true);
+        }
+      }
+
+      @Override
+      public Executor getFlushExecutor() {
+        return Executors.newFixedThreadPool(2);
+      }
+    };
+
+    collector.collect(2); // 7페이지, 배치 2 -> 3번 저장 호출
+
+    // collect() 반환 시점에 모든 저장이 완료되어야 함
+    assertTrue(allSavesCompleted.get());
+  }
+
+  @Test
+  @DisplayName("동기 모드(기본값): 기존 동작과 동일")
+  void syncSave_backwardCompatible() {
+    List<String> executionOrder = Collections.synchronizedList(new ArrayList<>());
+
+    AbstractListCollector collector = new AbstractListCollector() {
+      @Override
+      protected PageInfo processPage(int page) {
+        executionOrder.add("process-" + page);
+        return new PageInfo(5, 50, 10);
+      }
+
+      @Override
+      protected void saveBatch() {
+        executionOrder.add("save");
+      }
+
+      // getSaveExecutor() 오버라이드 안함 -> 기본값 null (동기 실행)
+    };
+
+    collector.collect(2);
+
+    // 동기 모드: 첫 save가 process-4보다 먼저 실행됨
+    int saveIndex = executionOrder.indexOf("save");
+    int process4Index = executionOrder.indexOf("process-4");
+    assertTrue(saveIndex < process4Index, "동기 모드에서는 save가 process-4보다 먼저 실행되어야 함");
   }
 }

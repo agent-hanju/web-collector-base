@@ -35,7 +35,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
    * @param batchSize 배치 크기
    * @return 수집 결과
    */
-  public final ListCollectedResult collect(int batchSize) {
+  public final ListCollectedResult collect(final int batchSize) {
     return collect(batchSize, ICollectorLogger.noOp());
   }
 
@@ -53,32 +53,34 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
     final AtomicInteger failurePageCount = new AtomicInteger(0);
     final AtomicInteger successItemCount = new AtomicInteger(0);
     final AtomicInteger batchNumber = new AtomicInteger(0);
+    final List<CompletableFuture<Void>> flushFutures = new ArrayList<>();
 
     try {
-      // 첫 페이지로 전체 페이지 수 확인
-      final PageInfo firstPageInfo = processPage(1);
-      totalPage.set(firstPageInfo.totalPage());
-      totalItem.set(firstPageInfo.totalItem());
-      successPageCount.incrementAndGet();
-      successItemCount.addAndGet(firstPageInfo.itemCount());
+      if (!isShutdownRequested()) {
+        // 첫 페이지로 전체 페이지 수 확인
+        final PageInfo firstPageInfo = processPage(1);
+        totalPage.set(firstPageInfo.totalPage());
+        totalItem.set(firstPageInfo.totalItem());
+        successPageCount.incrementAndGet();
+        successItemCount.addAndGet(firstPageInfo.itemCount());
 
-      logger.onStart(totalPage.get(), totalItem.get());
-      logger.onUnitSuccess(1, firstPageInfo.itemCount());
+        logger.onStart(totalPage.get(), totalItem.get());
+        logger.onUnitSuccess(1, firstPageInfo.itemCount());
 
-      if (totalPage.get() <= 1) {
-        saveBatchWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger);
-        logger.onComplete(totalPage.get(), totalItem.get(), failurePageCount.get(), successItemCount.get());
-        return new ListCollectedResult(totalPage.get(), totalItem.get(), successPageCount.get(),
-            failurePageCount.get(), successItemCount.get());
+        if (totalPage.get() <= 1) {
+          flushWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger);
+          logger.onComplete(totalPage.get(), totalItem.get(), failurePageCount.get(), successItemCount.get());
+          return new ListCollectedResult(totalPage.get(), totalItem.get(), successPageCount.get(),
+              failurePageCount.get(), successItemCount.get());
+        }
       }
-
       // 나머지 페이지 병렬 처리
       final List<CompletableFuture<Void>> futures = new ArrayList<>();
       for (int page = 2; page <= totalPage.get() && !isShutdownRequested(); page++) {
         final int currentPage = page;
         final CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
           try {
-            PageInfo pageInfo = processPage(currentPage);
+            final PageInfo pageInfo = processPage(currentPage);
             successPageCount.incrementAndGet();
             successItemCount.addAndGet(pageInfo.itemCount());
             logger.onUnitSuccess(currentPage, pageInfo.itemCount());
@@ -89,23 +91,36 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
         }, getExecutor());
         futures.add(future);
 
-        // 배치 크기마다 저장
+        // 배치 크기마다 flush
         if (futures.size() >= batchSize) {
           CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
           futures.clear();
-          saveBatchWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger);
+          flushFutures.add(CompletableFuture.runAsync(
+              () -> flushWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger),
+              getFlushExecutor()));
         }
       }
 
       // 남은 작업 처리
       if (!futures.isEmpty()) {
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        saveBatchWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger);
+        flushFutures.add(CompletableFuture.runAsync(
+            () -> flushWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger),
+            getFlushExecutor()));
       }
+
+      // 모든 flush 완료 대기
+      CompletableFuture.allOf(flushFutures.toArray(new CompletableFuture[0])).join();
 
       logger.onComplete(totalPage.get(), totalItem.get(), failurePageCount.get(), successItemCount.get());
 
     } catch (Exception e) {
+      // 에러 발생 시에도 진행 중인 flush 완료 대기 (데이터 손실 방지)
+      try {
+        CompletableFuture.allOf(flushFutures.toArray(new CompletableFuture[0])).join();
+      } catch (Exception ignored) {
+        // 로깅은 flushWithLogging에서 이미 처리됨
+      }
       logger.onError(totalPage.get(), totalItem.get(), successPageCount.get(),
           failurePageCount.get(), successItemCount.get(), e);
     }
@@ -114,7 +129,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
         failurePageCount.get(), successItemCount.get());
   }
 
-  private void saveBatchWithLogging(final int batch, final int itemCount, final ICollectorLogger logger) {
+  private void flushWithLogging(final int batch, final int itemCount, final ICollectorLogger logger) {
     try {
       saveBatch();
       logger.onBatchSuccess(batch, itemCount);
