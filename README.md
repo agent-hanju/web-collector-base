@@ -1,6 +1,6 @@
 # Web Collector Base
 
-웹/API 수집 서비스를 위한 베이스 라이브러리
+웹 수집 프로젝트를 위한 베이스 라이브러리
 
 ## 설치
 
@@ -12,7 +12,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.agent-hanju:web-collector-base:0.1.0'
+    implementation 'com.github.agent-hanju:web-collector-base:0.2.0'
 }
 ```
 
@@ -35,7 +35,7 @@ public class ArticleListCollector extends AbstractListCollector {
         ApiResponse response = apiClient.getList(page);
         List<Article> articles = parseArticles(response);
         buffer.addAll(articles);
-        return new PageInfo(page, response.getTotalPage(), response.getTotalCount(), articles.size());
+        return new PageInfo(response.getTotalPage(), response.getTotalCount(), articles.size());
     }
 
     @Override
@@ -94,12 +94,18 @@ ContentCollectedResult result = collector.collect(ids, 50); // 50건마다 저�
 @Component
 public class ArticleListCollector extends AbstractListCollector {
 
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final Executor executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final Executor flushExecutor = Executors.newSingleThreadExecutor();
     private volatile boolean shutdownRequested = false;
 
     @Override
     public Executor getExecutor() {
-        return executor;
+        return executor; // 수집 작업 병렬 실행
+    }
+
+    @Override
+    public Executor getFlushExecutor() {
+        return flushExecutor; // 저장 작업 비동기 실행 (v0.2.0)
     }
 
     @Override
@@ -113,6 +119,17 @@ public class ArticleListCollector extends AbstractListCollector {
     }
 }
 ```
+
+| 메서드               | 용도                          | 기본값                 |
+| -------------------- | ----------------------------- | ---------------------- |
+| `getExecutor()`      | 배치 내 작업 병렬 실행        | `Runnable::run` (동기) |
+| `getFlushExecutor()` | 배치 완료 후 저장 비동기 실행 | `Runnable::run` (동기) |
+
+**비동기 플러시 동작 (v0.2.0):**
+
+- 배치 수집 완료 → 비동기로 저장 시작 → 다음 배치 수집 시작
+- `collect()` 반환 전 모든 저장 완료 보장
+- 저장 실패해도 수집은 계속 진행
 
 ### DB 동시 접근 제어
 
@@ -178,13 +195,15 @@ ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
 
 ### Core DTO
 
-| 클래스                   | 설명                                                   |
-| ------------------------ | ------------------------------------------------------ |
-| `PageInfo`               | 페이지 정보 (현재 페이지, 전체 페이지, 전체 아이템 수) |
-| `ListCollectedResult`    | 목록 수집 결과 (수집 건수, 신규 건수 등)               |
-| `ContentCollectedResult` | 본문 수집 결과 (전체, 성공, 실패 건수)                 |
+| 클래스                   | 설명                                                      |
+| ------------------------ | --------------------------------------------------------- |
+| `PageInfo`               | 페이지 정보 (전체 페이지, 전체 아이템 수, 현재 아이템 수) |
+| `ListCollectedResult`    | 목록 수집 결과 (수집 건수, 신규 건수 등)                  |
+| `ContentCollectedResult` | 본문 수집 결과 (전체, 성공, 실패 건수)                    |
 
 ### JPA
+
+이 프로젝트에서 사용되지 않습니다.(Deprecated 예정)
 
 | 클래스                   | 설명                                               |
 | ------------------------ | -------------------------------------------------- |
@@ -198,13 +217,6 @@ ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
 | ---------------------------- | ------------------------------ |
 | `ShutdownHookManager`        | 종료 시 수집기에 shutdown 요청 |
 | `CollectorAutoConfiguration` | Spring Boot AutoConfiguration  |
-
-### Util
-
-| 클래스           | 설명                            |
-| ---------------- | ------------------------------- |
-| `JsonParserUtil` | Jackson 기반 JSON 파싱 유틸리티 |
-| `HtmlParserUtil` | Jsoup 기반 HTML 정제 유틸리티   |
 
 ## 요구사항
 
