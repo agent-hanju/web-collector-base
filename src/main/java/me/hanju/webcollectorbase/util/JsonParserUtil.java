@@ -9,6 +9,7 @@ import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
 
 /** Jackson 기반 JSON 파싱 유틸리티 클래스 */
+@Deprecated(since = "0.2.0")
 @Slf4j
 @UtilityClass
 public class JsonParserUtil {

@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
  * 테이블과 이미지 태그는 보존하고, 스크립트/스타일/폼 요소는 완전히 제거합니다.
  * </p>
  */
+@Deprecated(since = "0.2.0")
 @Slf4j
 @UtilityClass
 public class HtmlParserUtil {
