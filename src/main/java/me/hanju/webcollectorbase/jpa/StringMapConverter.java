@@ -19,7 +19,8 @@ import lombok.extern.slf4j.Slf4j;
 public class StringMapConverter implements AttributeConverter<Map<String, String>, String> {
 
   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-  private static final TypeReference<HashMap<String, String>> TYPE_REF = new TypeReference<>() {};
+  private static final TypeReference<HashMap<String, String>> TYPE_REF = new TypeReference<>() {
+  };
 
   @Override
   public String convertToDatabaseColumn(Map<String, String> attribute) {

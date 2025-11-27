@@ -6,17 +6,32 @@ import java.util.Map;
 import jakarta.persistence.Column;
 import jakarta.persistence.Convert;
 import jakarta.persistence.MappedSuperclass;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import lombok.experimental.SuperBuilder;
 
-/**
- * 도메인 엔티티 베이스 클래스.
- * <p>
- * unexpectedFieldMap을 제공합니다.
- * </p>
- */
+/** 도메인 엔티티 베이스 클래스 */
+@SuperBuilder
 @Getter
+@Setter(AccessLevel.PRIVATE)
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+@AllArgsConstructor(access = AccessLevel.PROTECTED)
 @MappedSuperclass
 public abstract class AbstractDomainEntity {
+  @Builder.Default
+  @Column(name = "collected")
+  private boolean collected = false;
+
+  /**
+   * 해당 데이터가 수집 완료되었음을 알린다.
+   */
+  public void completeCollected() {
+    this.collected = true;
+  }
 
   @Column(name = "unexpected_field_map", columnDefinition = "TEXT")
   @Convert(converter = StringMapConverter.class)
@@ -28,7 +43,7 @@ public abstract class AbstractDomainEntity {
    * @param key   필드명
    * @param value 직렬화된 값
    */
-  public void putUnexpectedField(String key, String value) {
+  public void putUnexpectedField(final String key, final String value) {
     if (key != null) {
       final Map<String, String> newMap;
       if (unexpectedFieldMap == null) {
@@ -40,4 +55,5 @@ public abstract class AbstractDomainEntity {
       this.unexpectedFieldMap = newMap;
     }
   }
+
 }
