@@ -3,6 +3,7 @@ package me.hanju.webcollectorbase.core;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import me.hanju.webcollectorbase.core.dto.ListCollectedResult;
@@ -53,6 +54,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
     final AtomicInteger failurePageCount = new AtomicInteger(0);
     final AtomicInteger successItemCount = new AtomicInteger(0);
     final AtomicInteger batchNumber = new AtomicInteger(0);
+    final Semaphore semaphore = new Semaphore(getMaxPendingFlushes());
     final List<CompletableFuture<Void>> flushFutures = new ArrayList<>();
 
     try {
@@ -95,18 +97,36 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
         if (futures.size() >= batchSize) {
           CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
           futures.clear();
-          flushFutures.add(CompletableFuture.runAsync(
-              () -> flushWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger),
-              getFlushExecutor()));
+
+          // backpressure 여유 있을 때까지 대기
+          semaphore.acquireUninterruptibly();
+
+          final int currentBatch = batchNumber.incrementAndGet();
+          final int currentItemCount = successItemCount.get();
+          flushFutures.add(CompletableFuture.runAsync(() -> {
+            try {
+              flushWithLogging(currentBatch, currentItemCount, logger);
+            } finally {
+              semaphore.release();
+            }
+          }, getExecutor()));
         }
       }
 
       // 남은 작업 처리
       if (!futures.isEmpty()) {
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        flushFutures.add(CompletableFuture.runAsync(
-            () -> flushWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger),
-            getFlushExecutor()));
+
+        semaphore.acquireUninterruptibly();
+        final int currentBatch = batchNumber.incrementAndGet();
+        final int currentItemCount = successItemCount.get();
+        flushFutures.add(CompletableFuture.runAsync(() -> {
+          try {
+            flushWithLogging(currentBatch, currentItemCount, logger);
+          } finally {
+            semaphore.release();
+          }
+        }, getExecutor()));
       }
 
       // 모든 flush 완료 대기

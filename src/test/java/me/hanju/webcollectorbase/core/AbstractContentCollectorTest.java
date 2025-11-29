@@ -135,7 +135,7 @@ class AbstractContentCollectorTest {
       }
 
       @Override
-      public Executor getFlushExecutor() {
+      public Executor getExecutor() {
         return Executors.newFixedThreadPool(2);
       }
     };
@@ -170,7 +170,7 @@ class AbstractContentCollectorTest {
       }
 
       @Override
-      public Executor getFlushExecutor() {
+      public Executor getExecutor() {
         return Runnable::run; // 동기지만 비동기 경로 테스트
       }
     };
@@ -205,7 +205,7 @@ class AbstractContentCollectorTest {
       }
 
       @Override
-      public Executor getFlushExecutor() {
+      public Executor getExecutor() {
         return Executors.newFixedThreadPool(2);
       }
     };
@@ -218,9 +218,9 @@ class AbstractContentCollectorTest {
   }
 
   @Test
-  @DisplayName("동기 모드(기본값): 기존 동작과 동일")
-  void syncSave_backwardCompatible() {
-    List<String> executionOrder = Collections.synchronizedList(new ArrayList<>());
+  @DisplayName("기본값(순차 실행): getExecutor 오버라이드 없이 순차 처리")
+  void defaultExecutor_sequentialProcessing() {
+    List<String> executionOrder = new ArrayList<>();
 
     AbstractContentCollector<Long> collector = new AbstractContentCollector<>() {
       @Override
@@ -230,18 +230,189 @@ class AbstractContentCollectorTest {
 
       @Override
       protected void saveBatch() {
-        executionOrder.add("save");
+        executionOrder.add("flush");
       }
 
-      // getSaveExecutor() 오버라이드 안함 -> 기본값 null (동기 실행)
+      // getExecutor() 오버라이드 안함 → 기본값 Runnable::run (순차 실행)
     };
 
-    List<Long> ids = List.of(1L, 2L, 3L);
-    collector.collect(ids, 2);
+    List<Long> ids = List.of(1L, 2L, 3L, 4L, 5L);
+    collector.collect(ids, 2); // 배치 2
 
-    // 동기 모드: save가 process-3보다 먼저 실행됨
-    int saveIndex = executionOrder.indexOf("save");
+    // 순차 실행이므로 순서가 보장됨
+    System.out.println("실행 순서: " + executionOrder);
+
+    // 첫 flush가 process-3보다 먼저 실행되어야 함 (순차 실행 증명)
+    int firstFlushIndex = executionOrder.indexOf("flush");
     int process3Index = executionOrder.indexOf("process-3");
-    assertTrue(saveIndex < process3Index, "동기 모드에서는 save가 process-3보다 먼저 실행되어야 함");
+    assertTrue(firstFlushIndex < process3Index,
+        "순차 실행에서는 flush가 process-3보다 먼저 실행되어야 함");
+
+    assertEquals("process-1", executionOrder.get(0));
+  }
+
+  @Test
+  @DisplayName("backpressure: 동시 flush 개수가 maxPendingFlushes를 초과하지 않음")
+  void backpressure_limitsConcurrentFlushes() {
+    AtomicInteger concurrentFlushes = new AtomicInteger(0);
+    AtomicInteger maxConcurrentFlushes = new AtomicInteger(0);
+
+    AbstractContentCollector<Long> collector = new AbstractContentCollector<>() {
+      @Override
+      protected void processContent(Long id) {
+      }
+
+      @Override
+      protected void saveBatch() {
+        int current = concurrentFlushes.incrementAndGet();
+        maxConcurrentFlushes.updateAndGet(max -> Math.max(max, current));
+        try {
+          Thread.sleep(50);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } finally {
+          concurrentFlushes.decrementAndGet();
+        }
+      }
+
+      @Override
+      public Executor getExecutor() {
+        return Executors.newFixedThreadPool(10);
+      }
+
+      @Override
+      public int getMaxPendingFlushes() {
+        return 2;
+      }
+    };
+
+    // 20개 ID, 배치 3 → 7번 flush
+    List<Long> ids = new ArrayList<>();
+    for (long i = 1; i <= 20; i++) {
+      ids.add(i);
+    }
+    collector.collect(ids, 3);
+
+    assertTrue(maxConcurrentFlushes.get() <= 2,
+        "동시 flush 개수가 maxPendingFlushes를 초과함: " + maxConcurrentFlushes.get());
+  }
+
+  @Test
+  @DisplayName("maxPendingFlushes(기본값 3) 초과 시 flush 완료까지 다음 배치 시작 대기")
+  void flushCompletionUnblocksNextBatch() {
+    AtomicInteger flushNumber = new AtomicInteger(0);
+    AtomicInteger concurrentFlushes = new AtomicInteger(0);
+    AtomicInteger maxConcurrentFlushes = new AtomicInteger(0);
+    List<String> timeline = Collections.synchronizedList(new ArrayList<>());
+    long testStartTime = System.currentTimeMillis();
+
+    AbstractContentCollector<Long> collector = new AbstractContentCollector<>() {
+      @Override
+      protected void processContent(Long id) {
+      }
+
+      @Override
+      protected void saveBatch() {
+        int myFlushNumber = flushNumber.incrementAndGet();
+        int concurrent = concurrentFlushes.incrementAndGet();
+        maxConcurrentFlushes.updateAndGet(max -> Math.max(max, concurrent));
+        long elapsed = System.currentTimeMillis() - testStartTime;
+
+        timeline.add(String.format("[%4dms] flush-%d START (concurrent=%d)", elapsed, myFlushNumber, concurrent));
+
+        try {
+          Thread.sleep(200);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } finally {
+          elapsed = System.currentTimeMillis() - testStartTime;
+          concurrentFlushes.decrementAndGet();
+          timeline.add(String.format("[%4dms] flush-%d END", elapsed, myFlushNumber));
+        }
+      }
+
+      @Override
+      public Executor getExecutor() {
+        return Executors.newFixedThreadPool(6);
+      }
+
+      // getMaxPendingFlushes() 오버라이드 안함 → 기본값 3 사용
+    };
+
+    // 16개 ID, 배치 4 → 4번 flush
+    List<Long> ids = new ArrayList<>();
+    for (long i = 1; i <= 16; i++) {
+      ids.add(i);
+    }
+    collector.collect(ids, 4);
+
+    System.out.println("=== ContentCollector Flush 타임라인 (maxPendingFlushes=3) ===");
+    timeline.forEach(System.out::println);
+    System.out.println("최대 동시 flush: " + maxConcurrentFlushes.get());
+
+    assertTrue(maxConcurrentFlushes.get() <= 3,
+        "동시 flush가 maxPendingFlushes(3)를 초과함: " + maxConcurrentFlushes.get());
+  }
+
+  @Test
+  @DisplayName("빠른 처리 + 느린 저장: backpressure로 제어")
+  void fastProcessingSlowFlush_backpressureControlsQueue() {
+    AtomicInteger concurrentFlushes = new AtomicInteger(0);
+    AtomicInteger maxConcurrentFlushes = new AtomicInteger(0);
+    AtomicInteger completedFlushes = new AtomicInteger(0);
+
+    AbstractContentCollector<Long> collector = new AbstractContentCollector<>() {
+      @Override
+      protected void processContent(Long id) {
+        // 빠른 처리
+      }
+
+      @Override
+      protected void saveBatch() {
+        int current = concurrentFlushes.incrementAndGet();
+        maxConcurrentFlushes.updateAndGet(max -> Math.max(max, current));
+
+        try {
+          Thread.sleep(300); // 느린 저장
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } finally {
+          concurrentFlushes.decrementAndGet();
+          completedFlushes.incrementAndGet();
+        }
+      }
+
+      @Override
+      public Executor getExecutor() {
+        return Executors.newFixedThreadPool(8);
+      }
+
+      @Override
+      public int getMaxPendingFlushes() {
+        return 2;
+      }
+    };
+
+    // 30개 ID, 배치 5 → 6번 flush
+    List<Long> ids = new ArrayList<>();
+    for (long i = 1; i <= 30; i++) {
+      ids.add(i);
+    }
+
+    long startTime = System.currentTimeMillis();
+    ContentCollectedResult result = collector.collect(ids, 5);
+    long totalTime = System.currentTimeMillis() - startTime;
+
+    assertEquals(30, result.successCount());
+    assertTrue(maxConcurrentFlushes.get() <= 2,
+        "동시 flush가 2를 초과: " + maxConcurrentFlushes.get());
+
+    // 6번 flush, 각 300ms, 동시 2개 → 최소 900ms
+    assertTrue(totalTime >= 800, "backpressure로 인해 시간이 늘어나야 함: " + totalTime + "ms");
+
+    System.out.println("=== ContentCollector 처리-저장 불균형 테스트 ===");
+    System.out.println("총 소요시간: " + totalTime + "ms");
+    System.out.println("최대 동시 flush: " + maxConcurrentFlushes.get());
+    System.out.println("완료된 flush: " + completedFlushes.get());
   }
 }

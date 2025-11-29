@@ -151,14 +151,14 @@ class AbstractListCollectorTest {
       }
 
       @Override
-      public Executor getFlushExecutor() {
+      public Executor getExecutor() {
         return Executors.newFixedThreadPool(2);
       }
     };
 
     ListCollectedResult result = collector.collect(3);
 
-    // 10페이지, 배치 크기 3 -> 3번 저장 (첫페이지 제외 9페이지: 9 / 3 = 3번)
+    // 10페이지, 배치 크기 3 -> 4번 저장 (첫페이지 포함: 1 + 9/3 = 4번)
     assertEquals(3, savedBatches.size());
     assertEquals(10, result.successPageCount());
     assertEquals(10, processCount.get());
@@ -186,7 +186,7 @@ class AbstractListCollectorTest {
       }
 
       @Override
-      public Executor getFlushExecutor() {
+      public Executor getExecutor() {
         return Runnable::run; // 동기지만 비동기 경로 테스트
       }
     };
@@ -221,7 +221,7 @@ class AbstractListCollectorTest {
       }
 
       @Override
-      public Executor getFlushExecutor() {
+      public Executor getExecutor() {
         return Executors.newFixedThreadPool(2);
       }
     };
@@ -233,9 +233,9 @@ class AbstractListCollectorTest {
   }
 
   @Test
-  @DisplayName("동기 모드(기본값): 기존 동작과 동일")
-  void syncSave_backwardCompatible() {
-    List<String> executionOrder = Collections.synchronizedList(new ArrayList<>());
+  @DisplayName("기본값(순차 실행): getExecutor 오버라이드 없이 순차 처리")
+  void defaultExecutor_sequentialProcessing() {
+    List<String> executionOrder = new ArrayList<>();
 
     AbstractListCollector collector = new AbstractListCollector() {
       @Override
@@ -246,17 +246,68 @@ class AbstractListCollectorTest {
 
       @Override
       protected void saveBatch() {
-        executionOrder.add("save");
+        executionOrder.add("flush");
       }
 
-      // getSaveExecutor() 오버라이드 안함 -> 기본값 null (동기 실행)
+      // getExecutor() 오버라이드 안함 → 기본값 Runnable::run (순차 실행)
     };
 
-    collector.collect(2);
+    collector.collect(2); // 배치 2
 
-    // 동기 모드: 첫 save가 process-4보다 먼저 실행됨
-    int saveIndex = executionOrder.indexOf("save");
+    // 순차 실행이므로 순서가 보장됨:
+    // process-1 → process-2, process-3 → flush → process-4, process-5 → flush
+    System.out.println("실행 순서: " + executionOrder);
+
+    // 첫 flush가 process-4보다 먼저 실행되어야 함 (순차 실행 증명)
+    int firstFlushIndex = executionOrder.indexOf("flush");
     int process4Index = executionOrder.indexOf("process-4");
-    assertTrue(saveIndex < process4Index, "동기 모드에서는 save가 process-4보다 먼저 실행되어야 함");
+    assertTrue(firstFlushIndex < process4Index,
+        "순차 실행에서는 flush가 process-4보다 먼저 실행되어야 함");
+
+    // 모든 페이지가 순서대로 처리됨
+    assertEquals("process-1", executionOrder.get(0));
+  }
+
+  @Test
+  @DisplayName("backpressure: 동시 flush 개수가 maxPendingFlushes를 초과하지 않음")
+  void backpressure_limitsConcurrentFlushes() {
+    AtomicInteger concurrentFlushes = new AtomicInteger(0);
+    AtomicInteger maxConcurrentFlushes = new AtomicInteger(0);
+
+    AbstractListCollector collector = new AbstractListCollector() {
+      @Override
+      protected PageInfo processPage(int page) {
+        return new PageInfo(20, 200, 10); // 20페이지
+      }
+
+      @Override
+      protected void saveBatch() {
+        int current = concurrentFlushes.incrementAndGet();
+        maxConcurrentFlushes.updateAndGet(max -> Math.max(max, current));
+        try {
+          Thread.sleep(50); // flush 지연
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } finally {
+          concurrentFlushes.decrementAndGet();
+        }
+      }
+
+      @Override
+      public Executor getExecutor() {
+        return Executors.newFixedThreadPool(10); // 충분히 많은 스레드
+      }
+
+      @Override
+      public int getMaxPendingFlushes() {
+        return 2; // 동시 flush 최대 2개
+      }
+    };
+
+    collector.collect(3); // 20페이지, 배치 3 -> 여러 번 flush
+
+    // 동시 flush가 maxPendingFlushes(2)를 초과하지 않아야 함
+    assertTrue(maxConcurrentFlushes.get() <= 2,
+        "동시 flush 개수가 maxPendingFlushes를 초과함: " + maxConcurrentFlushes.get());
   }
 }
