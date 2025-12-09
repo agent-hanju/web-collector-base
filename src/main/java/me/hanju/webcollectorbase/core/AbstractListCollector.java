@@ -37,7 +37,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
    * @return 수집 결과
    */
   public final ListCollectedResult collect(final int batchSize) {
-    return collect(batchSize, ICollectorLogger.noOp());
+    return collect(batchSize, IListCollectorLogger.noOp());
   }
 
   /**
@@ -47,7 +47,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
    * @param logger    로거
    * @return 수집 결과
    */
-  public final ListCollectedResult collect(final int batchSize, final ICollectorLogger logger) {
+  public final ListCollectedResult collect(final int batchSize, final IListCollectorLogger logger) {
     final AtomicInteger totalPage = new AtomicInteger(1);
     final AtomicInteger totalItem = new AtomicInteger(0);
     final AtomicInteger successPageCount = new AtomicInteger(0);
@@ -67,7 +67,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
         successItemCount.addAndGet(firstPageInfo.itemCount());
 
         logger.onStart(totalPage.get(), totalItem.get());
-        logger.onUnitSuccess(1, firstPageInfo.itemCount());
+        logger.onPageSuccess(1, firstPageInfo.itemCount());
 
         if (totalPage.get() <= 1) {
           flushWithLogging(batchNumber.incrementAndGet(), successItemCount.get(), logger);
@@ -85,10 +85,10 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
             final PageInfo pageInfo = processPage(currentPage);
             successPageCount.incrementAndGet();
             successItemCount.addAndGet(pageInfo.itemCount());
-            logger.onUnitSuccess(currentPage, pageInfo.itemCount());
+            logger.onPageSuccess(currentPage, pageInfo.itemCount());
           } catch (Exception e) {
             failurePageCount.incrementAndGet();
-            logger.onUnitFail(currentPage, e);
+            logger.onPageFail(currentPage, e);
           }
         }, getExecutor());
         futures.add(future);
@@ -149,7 +149,7 @@ public abstract class AbstractListCollector implements BatchExecutionConfig {
         failurePageCount.get(), successItemCount.get());
   }
 
-  private void flushWithLogging(final int batch, final int itemCount, final ICollectorLogger logger) {
+  private void flushWithLogging(final int batch, final int itemCount, final IListCollectorLogger logger) {
     try {
       saveBatch();
       logger.onBatchSuccess(batch, itemCount);

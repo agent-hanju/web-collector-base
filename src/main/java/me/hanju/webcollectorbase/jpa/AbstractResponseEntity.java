@@ -21,7 +21,11 @@ import lombok.experimental.SuperBuilder;
  * <p>
  * 대리키(id)와 raw JSON data, 수집 시각을 제공합니다.
  * </p>
+ *
+ * @deprecated 0.2.2부터 deprecated. JPA 엔티티는 프로젝트별로 직접 구현하세요.
+ *             0.2.5에서 삭제될 예정입니다.
  */
+@Deprecated(since = "0.2.2", forRemoval = true)
 @SuperBuilder
 @Getter
 @Setter(AccessLevel.PRIVATE)

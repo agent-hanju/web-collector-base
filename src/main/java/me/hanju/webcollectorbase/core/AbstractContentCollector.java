@@ -15,7 +15,11 @@ import me.hanju.webcollectorbase.core.dto.ContentCollectedResult;
  * </p>
  *
  * @param <T> ID 타입
+ * @deprecated 0.2.2부터 deprecated.
+ *             {@link AbstractItemProcessor}를 사용하세요.
+ *             0.2.5에서 삭제될 예정입니다.
  */
+@Deprecated(since = "0.2.2", forRemoval = true)
 public abstract class AbstractContentCollector<T> implements BatchExecutionConfig {
 
   /**
@@ -38,7 +42,7 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
    * @return 수집 결과
    */
   public final ContentCollectedResult collect(final List<T> ids, final int batchSize) {
-    return collect(ids, batchSize, ICollectorLogger.noOp());
+    return collect(ids, batchSize, IContentCollectorLogger.noOp());
   }
 
   /**
@@ -49,7 +53,7 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
    * @param logger    로거
    * @return 수집 결과
    */
-  public final ContentCollectedResult collect(final List<T> ids, final int batchSize, final ICollectorLogger logger) {
+  public final ContentCollectedResult collect(final List<T> ids, final int batchSize, final IContentCollectorLogger logger) {
     final int totalCount = ids.size();
     final AtomicInteger successCount = new AtomicInteger(0);
     final AtomicInteger failureCount = new AtomicInteger(0);
@@ -57,7 +61,7 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
     final Semaphore semaphore = new Semaphore(getMaxPendingFlushes());
     final List<CompletableFuture<Void>> flushFutures = new ArrayList<>();
 
-    logger.onStart(totalCount, totalCount);
+    logger.onStart(totalCount);
 
     try {
       final List<CompletableFuture<Void>> futures = new ArrayList<>();
@@ -70,10 +74,10 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
           try {
             processContent(id);
             successCount.incrementAndGet();
-            logger.onUnitSuccess(currentIndex, 1);
+            logger.onItemSuccess(currentIndex);
           } catch (Exception e) {
             failureCount.incrementAndGet();
-            logger.onUnitFail(currentIndex, e);
+            logger.onItemFail(currentIndex, e);
           }
         }, getExecutor()));
 
@@ -115,7 +119,7 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
       // 모든 flush 완료 대기
       CompletableFuture.allOf(flushFutures.toArray(new CompletableFuture[0])).join();
 
-      logger.onComplete(totalCount, totalCount, failureCount.get(), successCount.get());
+      logger.onComplete(totalCount, successCount.get(), failureCount.get());
 
     } catch (Exception e) {
       // 에러 발생 시에도 진행 중인 flush 완료 대기 (데이터 손실 방지)
@@ -124,13 +128,13 @@ public abstract class AbstractContentCollector<T> implements BatchExecutionConfi
       } catch (Exception ignored) {
         // 로깅은 flushWithLogging에서 이미 처리됨
       }
-      logger.onError(totalCount, totalCount, successCount.get(), failureCount.get(), successCount.get(), e);
+      logger.onError(totalCount, successCount.get(), failureCount.get(), e);
     }
 
     return new ContentCollectedResult(totalCount, successCount.get(), failureCount.get());
   }
 
-  private void flushWithLogging(int batch, int itemCount, ICollectorLogger logger) {
+  private void flushWithLogging(int batch, int itemCount, IContentCollectorLogger logger) {
     try {
       saveBatch();
       logger.onBatchSuccess(batch, itemCount);

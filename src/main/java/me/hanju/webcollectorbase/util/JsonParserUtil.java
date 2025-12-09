@@ -8,8 +8,12 @@ import jakarta.annotation.Nullable;
 import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
 
-/** Jackson 기반 JSON 파싱 유틸리티 클래스 */
-@Deprecated(since = "0.2.0")
+/**
+ * Jackson 기반 JSON 파싱 유틸리티 클래스
+ *
+ * @deprecated 0.2.0부터 deprecated. 0.2.4에서 삭제될 예정입니다.
+ */
+@Deprecated(since = "0.2.0", forRemoval = true)
 @Slf4j
 @UtilityClass
 public class JsonParserUtil {

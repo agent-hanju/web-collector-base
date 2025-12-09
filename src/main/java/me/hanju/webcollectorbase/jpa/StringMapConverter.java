@@ -13,7 +13,11 @@ import lombok.extern.slf4j.Slf4j;
 
 /**
  * Map&lt;String, String&gt;을 JSON 문자열로 변환하는 JPA Converter.
+ *
+ * @deprecated 0.2.2부터 deprecated. JPA Converter는 프로젝트별로 직접 구현하세요.
+ *             0.2.5에서 삭제될 예정입니다.
  */
+@Deprecated(since = "0.2.2", forRemoval = true)
 @Slf4j
 @Converter
 public class StringMapConverter implements AttributeConverter<Map<String, String>, String> {

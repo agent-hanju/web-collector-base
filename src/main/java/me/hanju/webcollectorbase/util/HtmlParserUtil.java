@@ -14,8 +14,10 @@ import lombok.extern.slf4j.Slf4j;
  * HTML 태그 제거, 리스트 변환, 불필요한 요소 정리 등의 기능을 제공합니다.
  * 테이블과 이미지 태그는 보존하고, 스크립트/스타일/폼 요소는 완전히 제거합니다.
  * </p>
+ *
+ * @deprecated 0.2.0부터 deprecated. 0.2.4에서 삭제될 예정입니다.
  */
-@Deprecated(since = "0.2.0")
+@Deprecated(since = "0.2.0", forRemoval = true)
 @Slf4j
 @UtilityClass
 public class HtmlParserUtil {

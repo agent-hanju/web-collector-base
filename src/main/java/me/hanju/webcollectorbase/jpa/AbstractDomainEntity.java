@@ -14,7 +14,13 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 import lombok.experimental.SuperBuilder;
 
-/** 도메인 엔티티 베이스 클래스 */
+/**
+ * 도메인 엔티티 베이스 클래스
+ *
+ * @deprecated 0.2.2부터 deprecated. JPA 엔티티는 프로젝트별로 직접 구현하세요.
+ *             0.2.5에서 삭제될 예정입니다.
+ */
+@Deprecated(since = "0.2.2", forRemoval = true)
 @SuperBuilder
 @Getter
 @Setter(AccessLevel.PRIVATE)

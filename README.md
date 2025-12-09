@@ -12,7 +12,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.agent-hanju:web-collector-base:0.2.0'
+    implementation 'com.github.agent-hanju:web-collector-base:0.2.2'
 }
 ```
 
@@ -52,7 +52,53 @@ public class ArticleListCollector extends AbstractListCollector {
 ListCollectedResult result = collector.collect(10); // 10페이지마다 저장
 ```
 
-### 본문 수집기 (AbstractContentCollector)
+### 아이템 프로세서 (AbstractItemProcessor)
+
+DB 커서, JPA Scroll API, Iterator 기반의 스트림/배치 처리에 사용합니다.
+메모리 효율적으로 대용량 데이터를 처리할 수 있습니다.
+
+```java
+@Component
+public class ArticleProcessor extends AbstractItemProcessor<Long> {
+
+    private final ArticleRepository repository;
+    private final SearchIndexService indexService;
+    private final List<Article> buffer = new ArrayList<>();
+    private int offset = 0;
+
+    @Override
+    protected Long getTotalCount() {
+        return repository.count();  // 선택적: 진행률 표시용
+    }
+
+    @Override
+    protected List<Long> fetchNextBatch(int batchSize) {
+        List<Long> ids = repository.findIds(offset, batchSize);
+        offset += ids.size();
+        return ids;  // 빈 리스트 반환 시 종료
+    }
+
+    @Override
+    protected void processItem(Long articleId) {
+        Article article = repository.findById(articleId).orElseThrow();
+        indexService.index(article);
+        buffer.add(article);
+    }
+
+    @Override
+    protected void saveBatch() {
+        indexService.flush();
+        buffer.clear();
+    }
+}
+
+// 사용
+ItemProcessedResult result = processor.process(100); // 100건씩 배치 처리
+```
+
+### 본문 수집기 (AbstractContentCollector) - Deprecated
+
+> **주의:** 0.2.2부터 deprecated되었습니다. `AbstractItemProcessor`를 사용하세요.
 
 ID 기반 상세 본문 수집에 사용합니다.
 
@@ -182,6 +228,75 @@ ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
 });
 ```
 
+## Migration Guide
+
+### ContentCollector → ItemProcessor (0.2.2+)
+
+`AbstractContentCollector`는 0.2.2부터 deprecated되었습니다.
+`AbstractItemProcessor`로 마이그레이션하세요.
+
+#### Before (ContentCollector)
+
+```java
+class MyCollector extends AbstractContentCollector<Long> {
+    @Override
+    protected void processContent(Long id) {
+        // 처리 로직
+    }
+
+    @Override
+    protected void saveBatch() {
+        // 저장 로직
+    }
+}
+
+// 사용
+List<Long> ids = repository.findAllIds();  // 전체 메모리 로드
+collector.collect(ids, batchSize);
+```
+
+#### After (ItemProcessor)
+
+```java
+class MyProcessor extends AbstractItemProcessor<Long> {
+    private int offset = 0;
+
+    @Override
+    protected Long getTotalCount() {
+        return repository.count();  // 선택적: 진행률 표시용
+    }
+
+    @Override
+    protected List<Long> fetchNextBatch(int batchSize) {
+        List<Long> batch = repository.findIds(offset, batchSize);
+        offset += batch.size();
+        return batch;  // 빈 리스트 반환 시 종료
+    }
+
+    @Override
+    protected void processItem(Long id) {
+        // 처리 로직
+    }
+
+    @Override
+    protected void saveBatch() {
+        // 저장 로직
+    }
+}
+
+// 사용
+processor.process(batchSize);  // 메모리 효율적
+```
+
+#### 주요 변경점
+
+| ContentCollector | ItemProcessor |
+|-----------------|---------------|
+| `List<T> ids` 전체 로드 | `fetchNextBatch()`로 점진적 로드 |
+| OOM 위험 | 메모리 효율적 |
+| `processContent(T)` | `processItem(T)` |
+| 진행률 항상 가능 | `getTotalCount()` 오버라이드 시 가능 |
+
 ## 주요 컴포넌트
 
 ### Core
@@ -190,8 +305,11 @@ ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
 | ----------------------------- | ------------------------------------------ |
 | `BatchExecutionConfig`        | Executor, 종료 요청 설정을 위한 인터페이스 |
 | `AbstractListCollector`       | 페이지 기반 목록 수집을 위한 추상 클래스   |
-| `AbstractContentCollector<T>` | ID 기반 본문 수집을 위한 추상 클래스       |
-| `ICollectorLogger`            | 수집 진행 로깅 인터페이스                  |
+| `AbstractItemProcessor<T>`    | 스트림/커서 기반 배치 처리를 위한 추상 클래스 |
+| `AbstractContentCollector<T>` | ID 기반 본문 수집 (deprecated: 0.2.2)      |
+| `IListCollectorLogger`        | 목록 수집 진행 로깅 인터페이스             |
+| `IItemProcessorLogger`        | 아이템 처리 진행 로깅 인터페이스           |
+| `IContentCollectorLogger`     | 본문 수집 진행 로깅 (deprecated: 0.2.2)    |
 
 ### Core DTO
 
@@ -199,7 +317,8 @@ ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
 | ------------------------ | --------------------------------------------------------- |
 | `PageInfo`               | 페이지 정보 (전체 페이지, 전체 아이템 수, 현재 아이템 수) |
 | `ListCollectedResult`    | 목록 수집 결과 (수집 건수, 신규 건수 등)                  |
-| `ContentCollectedResult` | 본문 수집 결과 (전체, 성공, 실패 건수)                    |
+| `ItemProcessedResult`    | 아이템 처리 결과 (전체, 성공, 실패 건수)                  |
+| `ContentCollectedResult` | 본문 수집 결과 (deprecated: 0.2.2)                        |
 
 ### JPA
 
@@ -222,6 +341,13 @@ ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
 
 - Java 17+
 - Spring Boot 3.x (optional)
+
+## Roadmap
+
+### 0.3.0 검토 예정
+
+- [ ] 네이밍 검토: `ListCollector` → `PageCollector`
+  - Java `List` API와의 혼동 방지
 
 ## 라이선스
 
