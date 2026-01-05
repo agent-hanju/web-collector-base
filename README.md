@@ -12,45 +12,11 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.agent-hanju:web-collector-base:0.2.2'
+    implementation 'com.github.agent-hanju:web-collector-base:0.3.0'
 }
 ```
 
 ## 사용법
-
-### 목록 수집기 (AbstractListCollector)
-
-페이지 기반 목록 수집에 사용합니다.
-
-```java
-@Component
-public class ArticleListCollector extends AbstractListCollector {
-
-    private final ArticleApiClient apiClient;
-    private final ArticleRepository repository;
-    private final List<Article> buffer = new ArrayList<>();
-
-    @Override
-    protected PageInfo processPage(int page) {
-        ApiResponse response = apiClient.getList(page);
-        List<Article> articles = parseArticles(response);
-        buffer.addAll(articles);
-        return new PageInfo(response.getTotalPage(), response.getTotalCount(), articles.size());
-    }
-
-    @Override
-    protected void saveBatch() {
-        // withSemaphore로 DB 동시 접근 제어
-        withSemaphore(() -> {
-            repository.saveAll(buffer);
-            buffer.clear();
-        });
-    }
-}
-
-// 사용
-ListCollectedResult result = collector.collect(10); // 10페이지마다 저장
-```
 
 ### 아이템 프로세서 (AbstractItemProcessor)
 
@@ -96,40 +62,84 @@ public class ArticleProcessor extends AbstractItemProcessor<Long> {
 ItemProcessedResult result = processor.process(100); // 100건씩 배치 처리
 ```
 
-### 본문 수집기 (AbstractContentCollector) - Deprecated
+### 페이지 프로세서 (AbstractPageProcessor)
 
-> **주의:** 0.2.2부터 deprecated되었습니다. `AbstractItemProcessor`를 사용하세요.
+페이지 기반 API 수집에 사용합니다. `AbstractItemProcessor`를 상속하며, 페이지 순회 로직이 내부에 구현되어 있어 `fetchTotalPage()`, `processPage()`, `saveBatch()`를 구현하면 됩니다.
 
-ID 기반 상세 본문 수집에 사용합니다.
+#### 내부 동작
+
+`AbstractPageProcessor`는 `AbstractItemProcessor`의 메서드를 다음과 같이 구현합니다:
+
+- **`process(batchSize)`**: 페이지 처리 전에 `fetchTotalPage()`를 호출하여 전체 페이지 수를 미리 파악한 뒤, `super.process()`를 호출합니다.
+
+- **`fetchNextBatch(batchSize)`**: `setBaseCriteria()`로 설정한 검색 조건을 기반으로, 다음 `batchSize`개 페이지에 대한 검색 조건(`PageCriteria`) 목록을 생성합니다. 마지막 페이지를 초과하면 빈 리스트를 반환하여 종료합니다.
+
+- **`processItem(criteria)`**: 전달받은 검색 조건으로 `processPage()`를 호출합니다.
+
+따라서 사용자는 **페이지 번호 관리 없이** `fetchTotalPage()`에서 전체 페이지 수 조회, `processPage()`에서 API 호출/파싱 로직만 작성하면 됩니다.
+
+#### 검색 조건 정의 (PageCriteria)
+
+```java
+// 검색 조건 클래스 정의
+public class ArticleSearchCriteria implements PageCriteria<ArticleSearchCriteria> {
+    private final String keyword;
+    private final LocalDate startDate;
+    private final int page;
+
+    public ArticleSearchCriteria(String keyword, LocalDate startDate, int page) {
+        this.keyword = keyword;
+        this.startDate = startDate;
+        this.page = page;
+    }
+
+    @Override
+    public ArticleSearchCriteria ofPage(int page) {
+        return new ArticleSearchCriteria(keyword, startDate, page);
+    }
+
+    public String toUrl() {
+        return "/api/articles?keyword=" + keyword + "&startDate=" + startDate + "&page=" + page;
+    }
+
+    // getters...
+}
+```
+
+#### 프로세서 구현
 
 ```java
 @Component
-public class ArticleContentCollector extends AbstractContentCollector<Long> {
+public class ArticlePageProcessor extends AbstractPageProcessor<ArticleSearchCriteria> {
 
     private final ArticleApiClient apiClient;
     private final ArticleRepository repository;
-    private final List<ArticleContent> buffer = new ArrayList<>();
+    private final List<Article> buffer = new ArrayList<>();
 
     @Override
-    protected void processContent(Long articleId) {
-        ApiResponse response = apiClient.getContent(articleId);
-        ArticleContent content = parseContent(response);
-        buffer.add(content);
+    protected int fetchTotalPage(ArticleSearchCriteria criteria) {
+        // 전체 페이지 수만 조회 (페이지 처리와 분리)
+        return apiClient.getTotalPage(criteria.toUrl());
+    }
+
+    @Override
+    protected PageInfo processPage(ArticleSearchCriteria criteria) {
+        ApiResponse response = apiClient.get(criteria.toUrl());
+        List<Article> articles = parseArticles(response);
+        buffer.addAll(articles);
+        return new PageInfo(response.getTotalPage(), response.getTotalCount(), articles.size());
     }
 
     @Override
     protected void saveBatch() {
-        // withSemaphore로 DB 동시 접근 제어
-        withSemaphore(() -> {
-            repository.saveAll(buffer);
-        });
+        repository.saveAll(buffer);
         buffer.clear();
     }
 }
 
 // 사용
-List<Long> ids = repository.findAllIds();
-ContentCollectedResult result = collector.collect(ids, 50); // 50건마다 저장
+processor.setBaseCriteria(new ArticleSearchCriteria("java", LocalDate.of(2024, 1, 1), 0));
+ItemProcessedResult result = processor.process(10); // 10페이지마다 저장
 ```
 
 ### 병렬 처리 설정
@@ -138,10 +148,9 @@ ContentCollectedResult result = collector.collect(ids, 50); // 50건마다 저�
 
 ```java
 @Component
-public class ArticleListCollector extends AbstractListCollector {
+public class ArticleProcessor extends AbstractItemProcessor<Long> {
 
     private final Executor executor = Executors.newVirtualThreadPerTaskExecutor();
-    private final Executor flushExecutor = Executors.newSingleThreadExecutor();
     private volatile boolean shutdownRequested = false;
 
     @Override
@@ -150,8 +159,8 @@ public class ArticleListCollector extends AbstractListCollector {
     }
 
     @Override
-    public Executor getFlushExecutor() {
-        return flushExecutor; // 저장 작업 비동기 실행 (v0.2.0)
+    public int getMaxPendingFlushes() {
+        return 3; // 동시에 진행 가능한 flush 작업 수 (기본값: 3)
     }
 
     @Override
@@ -166,169 +175,54 @@ public class ArticleListCollector extends AbstractListCollector {
 }
 ```
 
-| 메서드               | 용도                          | 기본값                 |
-| -------------------- | ----------------------------- | ---------------------- |
-| `getExecutor()`      | 배치 내 작업 병렬 실행        | `Runnable::run` (동기) |
-| `getFlushExecutor()` | 배치 완료 후 저장 비동기 실행 | `Runnable::run` (동기) |
-
-**비동기 플러시 동작 (v0.2.0):**
-
-- 배치 수집 완료 → 비동기로 저장 시작 → 다음 배치 수집 시작
-- `collect()` 반환 전 모든 저장 완료 보장
-- 저장 실패해도 수집은 계속 진행
-
-### DB 동시 접근 제어
-
-`getSemaphore()`를 오버라이드하여 DB 동시 접근을 제한합니다.
-
-```java
-@Component
-public class ArticleListCollector extends AbstractListCollector {
-
-    private final Semaphore semaphore = new Semaphore(1); // DB 동시 접근 1개로 제한
-
-    @Override
-    public Semaphore getSemaphore() {
-        return semaphore;
-    }
-
-    @Override
-    protected void saveBatch() {
-        withSemaphore(() -> {
-            repository.saveAll(buffer);
-        });
-        buffer.clear();
-    }
-}
-```
+| 메서드                  | 용도                           | 기본값                 |
+| ----------------------- | ------------------------------ | ---------------------- |
+| `getExecutor()`         | 배치 내 작업 병렬 실행         | `Runnable::run` (동기) |
+| `getMaxPendingFlushes()`| 동시 진행 가능한 flush 수      | `3`                    |
 
 ### 로깅
 
-`ICollectorLogger`를 구현하여 수집 진행 상황을 로깅할 수 있습니다.
+`IItemProcessorLogger`를 구현하여 처리 진행 상황을 로깅할 수 있습니다.
 
 ```java
-ListCollectedResult result = collector.collect(10, new ICollectorLogger() {
+ItemProcessedResult result = processor.process(100, new IItemProcessorLogger() {
     @Override
-    public void onStart(Integer totalUnit, Integer totalItem) {
-        log.info("수집 시작: {}페이지, {}건", totalUnit, totalItem);
+    public void onStart(Long totalCount) {
+        log.info("처리 시작: 총 {}건", totalCount);
     }
 
     @Override
-    public void onUnitSuccess(Integer unit, Integer itemCount) {
-        log.debug("페이지 {} 완료: {}건", unit, itemCount);
+    public void onBatchFetched(Integer batch, Integer itemCount) {
+        log.debug("배치 {} 로드: {}건", batch, itemCount);
     }
 
     @Override
-    public void onComplete(Integer totalUnit, Integer totalItem,
-                          Integer failureCount, Integer successItemCount) {
-        log.info("수집 완료: 성공 {}건, 실패 {}건", successItemCount, failureCount);
+    public void onComplete(Long totalProcessed, Long successCount, Long failureCount) {
+        log.info("처리 완료: 성공 {}건, 실패 {}건", successCount, failureCount);
     }
 
     // ... 나머지 메서드
 });
 ```
 
-## Migration Guide
-
-### ContentCollector → ItemProcessor (0.2.2+)
-
-`AbstractContentCollector`는 0.2.2부터 deprecated되었습니다.
-`AbstractItemProcessor`로 마이그레이션하세요.
-
-#### Before (ContentCollector)
-
-```java
-class MyCollector extends AbstractContentCollector<Long> {
-    @Override
-    protected void processContent(Long id) {
-        // 처리 로직
-    }
-
-    @Override
-    protected void saveBatch() {
-        // 저장 로직
-    }
-}
-
-// 사용
-List<Long> ids = repository.findAllIds();  // 전체 메모리 로드
-collector.collect(ids, batchSize);
-```
-
-#### After (ItemProcessor)
-
-```java
-class MyProcessor extends AbstractItemProcessor<Long> {
-    private int offset = 0;
-
-    @Override
-    protected Long getTotalCount() {
-        return repository.count();  // 선택적: 진행률 표시용
-    }
-
-    @Override
-    protected List<Long> fetchNextBatch(int batchSize) {
-        List<Long> batch = repository.findIds(offset, batchSize);
-        offset += batch.size();
-        return batch;  // 빈 리스트 반환 시 종료
-    }
-
-    @Override
-    protected void processItem(Long id) {
-        // 처리 로직
-    }
-
-    @Override
-    protected void saveBatch() {
-        // 저장 로직
-    }
-}
-
-// 사용
-processor.process(batchSize);  // 메모리 효율적
-```
-
-#### 주요 변경점
-
-| ContentCollector | ItemProcessor |
-|-----------------|---------------|
-| `List<T> ids` 전체 로드 | `fetchNextBatch()`로 점진적 로드 |
-| OOM 위험 | 메모리 효율적 |
-| `processContent(T)` | `processItem(T)` |
-| 진행률 항상 가능 | `getTotalCount()` 오버라이드 시 가능 |
-
 ## 주요 컴포넌트
 
 ### Core
 
-| 클래스                        | 설명                                       |
-| ----------------------------- | ------------------------------------------ |
-| `BatchExecutionConfig`        | Executor, 종료 요청 설정을 위한 인터페이스 |
-| `AbstractListCollector`       | 페이지 기반 목록 수집을 위한 추상 클래스   |
-| `AbstractItemProcessor<T>`    | 스트림/커서 기반 배치 처리를 위한 추상 클래스 |
-| `AbstractContentCollector<T>` | ID 기반 본문 수집 (deprecated: 0.2.2)      |
-| `IListCollectorLogger`        | 목록 수집 진행 로깅 인터페이스             |
-| `IItemProcessorLogger`        | 아이템 처리 진행 로깅 인터페이스           |
-| `IContentCollectorLogger`     | 본문 수집 진행 로깅 (deprecated: 0.2.2)    |
+| 클래스                     | 설명                                        |
+| -------------------------- | ------------------------------------------- |
+| `BatchExecutionConfig`     | Executor, 종료 요청 설정을 위한 인터페이스  |
+| `AbstractItemProcessor<T>` | 스트림/커서 기반 배치 처리를 위한 추상 클래스 |
+| `AbstractPageProcessor<C>` | 페이지 기반 수집을 위한 추상 클래스 (extends AbstractItemProcessor) |
+| `PageCriteria`             | 페이지 검색 조건 마커 인터페이스            |
+| `IItemProcessorLogger`     | 아이템 처리 진행 로깅 인터페이스            |
 
 ### Core DTO
 
-| 클래스                   | 설명                                                      |
-| ------------------------ | --------------------------------------------------------- |
-| `PageInfo`               | 페이지 정보 (전체 페이지, 전체 아이템 수, 현재 아이템 수) |
-| `ListCollectedResult`    | 목록 수집 결과 (수집 건수, 신규 건수 등)                  |
-| `ItemProcessedResult`    | 아이템 처리 결과 (전체, 성공, 실패 건수)                  |
-| `ContentCollectedResult` | 본문 수집 결과 (deprecated: 0.2.2)                        |
-
-### JPA
-
-이 프로젝트에서 사용되지 않습니다.(Deprecated 예정)
-
-| 클래스                   | 설명                                               |
-| ------------------------ | -------------------------------------------------- |
-| `AbstractDomainEntity`   | unexpectedFieldMap을 제공하는 도메인 엔티티 베이스 |
-| `AbstractResponseEntity` | API 응답 rawData 저장용 엔티티 베이스              |
-| `StringMapConverter`     | `Map<String, String>` ↔ JSON 변환기                |
+| 클래스                | 설명                                                      |
+| --------------------- | --------------------------------------------------------- |
+| `PageInfo`            | 페이지 정보 (전체 페이지, 전체 아이템 수, 현재 아이템 수) |
+| `ItemProcessedResult` | 처리 결과 (전체, 성공, 실패 건수)                         |
 
 ### Spring (Optional)
 
@@ -341,13 +235,6 @@ processor.process(batchSize);  // 메모리 효율적
 
 - Java 17+
 - Spring Boot 3.x (optional)
-
-## Roadmap
-
-### 0.3.0 검토 예정
-
-- [ ] 네이밍 검토: `ListCollector` → `PageCollector`
-  - Java `List` API와의 혼동 방지
 
 ## 라이선스
 

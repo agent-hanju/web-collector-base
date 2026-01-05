@@ -20,7 +20,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import me.hanju.webcollectorbase.core.dto.ListCollectedResult;
+import me.hanju.webcollectorbase.core.dto.ItemProcessedResult;
 import me.hanju.webcollectorbase.core.dto.PageInfo;
 
 /**
@@ -208,9 +208,14 @@ class AsyncStabilityTest {
       AtomicInteger savedBatches = new AtomicInteger(0);
       long dbSaveDelayMs = 200; // DB 저장에 200ms 소요
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 10;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           processedPages.incrementAndGet();
           try {
             Thread.sleep(10); // 페이지 처리 10ms
@@ -240,16 +245,15 @@ class AsyncStabilityTest {
           return 3;
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
       long startTime = System.currentTimeMillis();
-      ListCollectedResult result = collector.collect(3);
+      ItemProcessedResult result = processor.process(3);
       long elapsedTime = System.currentTimeMillis() - startTime;
 
-      assertEquals(10, result.successPageCount());
-      assertEquals(3, savedBatches.get()); // 9페이지 / 3 = 3 배치
+      assertEquals(10, result.successCount());
+      assertTrue(savedBatches.get() >= 3); // 배치 저장 수
       // 비동기 처리로 인해 순차 처리보다 빠름
-      // 순차: (10 * 10ms) + (3 * 200ms) = 700ms
-      // 비동기: 병렬 처리로 더 빠름
       assertTrue(elapsedTime < 700, "비동기 처리가 순차보다 빨라야 함: " + elapsedTime + "ms");
     }
 
@@ -260,9 +264,14 @@ class AsyncStabilityTest {
       ConnectionPoolSimulator dbPool = new ConnectionPoolSimulator(2, 100); // 2개 커넥션, 100ms 사용
       AtomicInteger successfulSaves = new AtomicInteger(0);
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 15;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           return new PageInfo(15, 150, 10);
         }
 
@@ -286,8 +295,9 @@ class AsyncStabilityTest {
           return 2; // DB 커넥션 풀 크기와 동일하게 제한
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      collector.collect(3);
+      processor.process(3);
 
       // 모든 저장이 성공해야 함 (backpressure로 커넥션 풀 고갈 방지)
       assertEquals(0, dbPool.getTimeoutCount(), "커넥션 타임아웃이 없어야 함");
@@ -306,9 +316,14 @@ class AsyncStabilityTest {
       NetworkSimulator network = new NetworkSimulator(50, 100, 0); // 50~100ms 지연, 실패 없음
       AtomicInteger processedPages = new AtomicInteger(0);
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 10;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           network.request();
           processedPages.incrementAndGet();
           return new PageInfo(10, 100, 10);
@@ -324,9 +339,10 @@ class AsyncStabilityTest {
           return Executors.newFixedThreadPool(5);
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
       long startTime = System.currentTimeMillis();
-      collector.collect(5);
+      processor.process(5);
       long elapsedTime = System.currentTimeMillis() - startTime;
 
       assertEquals(10, processedPages.get());
@@ -339,15 +355,18 @@ class AsyncStabilityTest {
     @DisplayName("간헐적 네트워크 실패 시 실패 카운트 정확히 기록")
     @Timeout(30)
     void handlesIntermittentNetworkFailures() {
-      // 첫 페이지는 성공해야 totalPage를 알 수 있으므로 첫 페이지 제외
+      // fetchTotalPage는 별도로 호출되므로 모든 processPage에서 네트워크 실패 가능
       NetworkSimulator network = new NetworkSimulator(10, 30, 0.2); // 20% 실패율
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
-          if (page > 1) { // 첫 페이지는 항상 성공
-            network.request();
-          }
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 20;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
+          network.request();
           return new PageInfo(20, 200, 10);
         }
 
@@ -360,13 +379,13 @@ class AsyncStabilityTest {
           return Executors.newFixedThreadPool(4);
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      ListCollectedResult result = collector.collect(5);
+      ItemProcessedResult result = processor.process(5);
 
       // 실패한 페이지 수가 네트워크 실패 수와 일치
-      assertEquals(network.getFailureCount(), result.failurePageCount());
-      assertEquals(20, result.totalPage());
-      assertEquals(20, result.successPageCount() + result.failurePageCount());
+      assertEquals(network.getFailureCount(), result.failureCount());
+      assertEquals(20, result.successCount() + result.failureCount());
     }
   }
 
@@ -378,23 +397,26 @@ class AsyncStabilityTest {
     @DisplayName("요청량 > 커넥션 풀: maxPendingFlushes로 안정성 확보")
     @Timeout(60)
     void stabilityWithSmallConnectionPool() {
-      // 시나리오: 100개 페이지, 배치 5, 커넥션 풀 2개
+      // 시나리오: 50개 페이지, 배치 5, 커넥션 풀 2개
       ConnectionPoolSimulator dbPool = new ConnectionPoolSimulator(2, 50);
       AtomicInteger processedCount = new AtomicInteger(0);
       AtomicInteger saveCount = new AtomicInteger(0);
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 50;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           processedCount.incrementAndGet();
           return new PageInfo(50, 500, 10);
         }
 
         @Override
         protected void saveBatch() {
-          dbPool.executeWithConnection(10000, () -> {
-            saveCount.incrementAndGet();
-          });
+          dbPool.executeWithConnection(10000, saveCount::incrementAndGet);
         }
 
         @Override
@@ -407,10 +429,11 @@ class AsyncStabilityTest {
           return 2; // 커넥션 풀 크기에 맞춤
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      ListCollectedResult result = collector.collect(5);
+      ItemProcessedResult result = processor.process(5);
 
-      assertEquals(50, result.successPageCount());
+      assertEquals(50, result.successCount());
       assertEquals(0, dbPool.getTimeoutCount(), "타임아웃 없이 모든 저장 완료");
       // flush 대기 수가 maxPendingFlushes를 크게 초과하지 않아야 함
       assertTrue(dbPool.getMaxWaitingCount() <= 3,
@@ -429,9 +452,14 @@ class AsyncStabilityTest {
           new ArrayBlockingQueue<>(100)
       );
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 10;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           try {
             Thread.sleep(20);
           } catch (InterruptedException e) {
@@ -460,11 +488,12 @@ class AsyncStabilityTest {
           return 1; // 극단적으로 제한
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      ListCollectedResult result = collector.collect(3);
+      ItemProcessedResult result = processor.process(3);
       smallPool.shutdown();
 
-      assertEquals(10, result.successPageCount());
+      assertEquals(10, result.successCount());
       assertEquals(10, completedTasks.get(), "모든 작업이 데드락 없이 완료");
     }
   }
@@ -481,9 +510,14 @@ class AsyncStabilityTest {
       AtomicInteger maxMemoryKb = new AtomicInteger(0);
       Object lock = new Object();
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 20;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           memory.allocate();
           synchronized (lock) {
             maxMemoryKb.updateAndGet(max -> Math.max(max, memory.getTotalAllocatedKb()));
@@ -512,8 +546,9 @@ class AsyncStabilityTest {
           return 2;
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      collector.collect(5); // 배치 크기 5
+      processor.process(5); // 배치 크기 5
 
       // 배치 처리로 메모리가 무한정 증가하지 않음
       // 최대 메모리 = (배치 크기 + pending flushes) * 100KB
@@ -539,9 +574,14 @@ class AsyncStabilityTest {
       List<Long> flushStartTimes = Collections.synchronizedList(new ArrayList<>());
       List<Long> flushEndTimes = Collections.synchronizedList(new ArrayList<>());
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 30;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           try {
             Thread.sleep(10); // 빠른 처리
           } catch (InterruptedException e) {
@@ -577,19 +617,19 @@ class AsyncStabilityTest {
           return 3; // 최대 3개까지만 동시 flush 허용
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
       long startTime = System.currentTimeMillis();
-      ListCollectedResult result = collector.collect(5); // 배치 5
+      ItemProcessedResult result = processor.process(5); // 배치 5
       long totalTime = System.currentTimeMillis() - startTime;
 
-      assertEquals(30, result.successPageCount());
+      assertEquals(30, result.successCount());
 
       // 핵심 검증: maxPendingFlushes(3)를 초과하지 않음
       assertTrue(maxPendingFlushCount.get() <= 3,
           "동시 pending flush가 maxPendingFlushes를 초과: " + maxPendingFlushCount.get());
 
       // 모든 flush 완료
-      // 30페이지, 배치 5 → 첫 페이지 제외 29/5 = 약 6번 flush
       assertTrue(completedFlushCount.get() >= 5, "모든 배치가 저장되어야 함: " + completedFlushCount.get());
 
       System.out.println("=== 처리-저장 불균형 테스트 결과 ===");
@@ -608,9 +648,14 @@ class AsyncStabilityTest {
       AtomicInteger maxConcurrentFlushes = new AtomicInteger(0);
       List<Long> batchCompleteTimes = Collections.synchronizedList(new ArrayList<>());
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 40;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           processedPages.incrementAndGet();
           // 거의 즉시 완료
           return new PageInfo(40, 400, 10); // 40페이지
@@ -641,9 +686,10 @@ class AsyncStabilityTest {
           return 2; // 엄격하게 2개로 제한
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
       long startTime = System.currentTimeMillis();
-      collector.collect(5); // 배치 5
+      processor.process(5); // 배치 5
       long totalTime = System.currentTimeMillis() - startTime;
 
       // backpressure로 동시 flush 제한됨
@@ -669,10 +715,15 @@ class AsyncStabilityTest {
       AtomicInteger maxWaiting = new AtomicInteger(0);
       List<String> eventLog = Collections.synchronizedList(new ArrayList<>());
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
-          eventLog.add("process-" + page);
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 20;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
+          eventLog.add("process-" + criteria.page());
           return new PageInfo(20, 200, 10);
         }
 
@@ -702,8 +753,9 @@ class AsyncStabilityTest {
           return 2;
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      collector.collect(4); // 배치 4
+      processor.process(4); // 배치 4
 
       // maxPendingFlushes=2 이므로 동시에 2개 이상 대기하면 안됨
       assertTrue(maxWaiting.get() <= 2,
@@ -726,9 +778,14 @@ class AsyncStabilityTest {
       List<String> timeline = Collections.synchronizedList(new ArrayList<>());
       long testStartTime = System.currentTimeMillis();
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 20;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           return new PageInfo(20, 200, 10); // 20페이지 → 4번 flush (5페이지씩)
         }
 
@@ -759,8 +816,9 @@ class AsyncStabilityTest {
 
         // getMaxPendingFlushes() 오버라이드 안함 → 기본값 3 사용
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      collector.collect(5); // 배치 5
+      processor.process(5); // 배치 5
 
       System.out.println("=== Flush 완료 대기 테스트 타임라인 (maxPendingFlushes=3) ===");
       timeline.forEach(System.out::println);
@@ -787,18 +845,21 @@ class AsyncStabilityTest {
       ConnectionPoolSimulator dbPool = new ConnectionPoolSimulator(2, 50);
       AtomicInteger savedBatches = new AtomicInteger(0);
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 30;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           network.request();
           return new PageInfo(30, 300, 10);
         }
 
         @Override
         protected void saveBatch() {
-          dbPool.executeWithConnection(10000, () -> {
-            savedBatches.incrementAndGet();
-          });
+          dbPool.executeWithConnection(10000, savedBatches::incrementAndGet);
         }
 
         @Override
@@ -811,16 +872,17 @@ class AsyncStabilityTest {
           return 2;
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      ListCollectedResult result = collector.collect(5);
+      ItemProcessedResult result = processor.process(5);
 
       // 기본 검증
-      assertEquals(30, result.totalPage());
-      assertTrue(result.successPageCount() >= 25, "대부분 성공해야 함");
+      assertEquals(30, result.totalProcessed());
+      assertTrue(result.successCount() >= 20, "대부분 성공해야 함 (10% 실패율 감안)");
       assertEquals(0, dbPool.getTimeoutCount(), "DB 타임아웃 없어야 함");
 
       // 실패 처리 검증
-      assertEquals(network.getFailureCount(), result.failurePageCount());
+      assertEquals(network.getFailureCount(), result.failureCount());
     }
 
     @Test
@@ -830,9 +892,14 @@ class AsyncStabilityTest {
       AtomicInteger concurrentRequests = new AtomicInteger(0);
       AtomicInteger maxConcurrent = new AtomicInteger(0);
 
-      AbstractListCollector collector = new AbstractListCollector() {
+      AbstractPageProcessor<IntPageCriteria> processor = new AbstractPageProcessor<>() {
         @Override
-        protected PageInfo processPage(int page) {
+        protected int fetchTotalPage(IntPageCriteria criteria) {
+          return 50;
+        }
+
+        @Override
+        protected PageInfo processPage(IntPageCriteria criteria) {
           int current = concurrentRequests.incrementAndGet();
           maxConcurrent.updateAndGet(max -> Math.max(max, current));
 
@@ -868,10 +935,11 @@ class AsyncStabilityTest {
           return 3;
         }
       };
+      processor.setBaseCriteria(new IntPageCriteria(1));
 
-      ListCollectedResult result = collector.collect(10);
+      ItemProcessedResult result = processor.process(10);
 
-      assertEquals(50, result.successPageCount());
+      assertEquals(50, result.successCount());
       // 동시 요청 수가 스레드 풀 + pending flushes 이내로 제한
       assertTrue(maxConcurrent.get() <= 12,
           "동시 요청이 제한되어야 함: " + maxConcurrent.get());

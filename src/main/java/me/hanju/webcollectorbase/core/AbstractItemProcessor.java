@@ -65,7 +65,7 @@ public abstract class AbstractItemProcessor<T> implements BatchExecutionConfig {
    * @param batchSize 배치 크기
    * @return 처리 결과
    */
-  public final ItemProcessedResult process(final int batchSize) {
+  public ItemProcessedResult process(final int batchSize) {
     return process(batchSize, IItemProcessorLogger.noOp());
   }
 
@@ -76,7 +76,7 @@ public abstract class AbstractItemProcessor<T> implements BatchExecutionConfig {
    * @param logger    로거
    * @return 처리 결과
    */
-  public final ItemProcessedResult process(final int batchSize, final IItemProcessorLogger logger) {
+  public ItemProcessedResult process(final int batchSize, final IItemProcessorLogger logger) {
     final AtomicLong totalProcessed = new AtomicLong(0);
     final AtomicLong successCount = new AtomicLong(0);
     final AtomicLong failureCount = new AtomicLong(0);
